@@ -16,35 +16,6 @@ config_setting(
 
 
 #####
-
-
-# Main library
-# rust_library(
-#     name = "staff-lib",
-#     srcs = [ "src/staff.rs",
-#              "src/main.rs"],
-#     edition = "2021",
-#     rustc_env = {
-#         "CARGO_MANIFEST_DIR": package_name(),
-#     },
-#     rustc_flags = select({
-#         "//:release": [
-#             "-Clto",
-#             "-Ccodegen-units=1",
-#             "-Cpanic=abort",
-#             "-Copt-level=3",
-#             "-Cstrip=symbols",
-#         ],
-#         "//conditions:default": [
-#             "-Copt-level=0",
-#         ],
-#     }),
-#     visibility = ["//visibility:public"],
-#     deps = [] + all_crate_deps(),
-# )
-
-
-
 rust_binary(
         name = "staff",  # Remove the .rs extension
         srcs = ["src/main.rs", "src/staff.rs"],

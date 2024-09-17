@@ -452,7 +452,10 @@ fn forward_daemon() {
         let mut total_error_count: u32 = 0;
         match is_fwd {
             true => {
-                let mut ds = downstream_statuses.lock().unwrap();
+                // hu hu hu this can be a bad problem!
+                // need to:
+                // 1. copy and drop the lock
+                // count the 'number' of blobs from the front of the deque and then only clear that many
                 let mut topics = topics_in_memory.lock().unwrap();
                 let mut status: HashMap<String, (u16, String)> = HashMap::new();
                 let mut cleared_topics = Vec::new();
@@ -494,6 +497,7 @@ fn forward_daemon() {
                 for b in cleared_topics {
                     topics.remove(&b);
                 }
+                let mut ds = downstream_statuses.lock().unwrap();
                 *ds = Some(DownstreamStatus {
                     last_run_completion: Instant::now(),
                     response: HashMap::new(),
