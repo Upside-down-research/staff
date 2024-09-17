@@ -1,0 +1,35 @@
+syntax = "proto3";
+package staff;
+
+message OkayEnough {}
+
+message Blob {
+        bytes datum = 1;
+}
+
+message BlobList {
+        repeated Blob data = 1;
+}
+
+message TopicSize {
+        int32 length = 1;
+}
+
+message DownstreamList {
+        uint32 jitter_seconds = 1;
+        uint32 delay_seconds = 2;
+        repeated string targets = 3;
+}
+
+message Target {
+        string target = 1;
+        uint32 status = 2;
+        string msg = 3;
+}
+
+message DownstreamStatus {
+        uint32 jitter_seconds = 1;
+        uint32 delay_seconds = 2;
+        bool is_forwarding = 3;
+        repeated string targets = 4;
+}
