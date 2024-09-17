@@ -1,0 +1,50 @@
+module(
+    name = "staff",
+    version = "1.0.0",
+)
+
+bazel_dep(name = "bazel_skylib", version = "1.6.1")
+bazel_dep(name = "rules_oci", version = "2.0.0-beta1")
+bazel_dep(name = "rules_pkg", version = "1.0.1")
+bazel_dep(name = "aspect_bazel_lib", version = "2.7.9")
+
+# Rusty.
+bazel_dep(name = "rules_rust", version = "0.49.3")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.80.1"],
+)
+use_repo(
+    rust,
+    "rust_toolchains",
+)
+
+register_toolchains("@rust_toolchains//:all")
+
+crate = use_extension("@rules_rust//crate_universe:docs_bzlmod.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = [
+        "//:Cargo.toml",
+    ],
+)
+use_repo(crate, "crates")
+
+oci = use_extension("@rules_oci//oci:extensions.bzl", "oci")
+oci.pull(
+    name = "base_image",
+    #digest = "sha256:0a4eaa0eecf5f8c050e5bba433f58c052be7587ee8af3e8b3910ef9ab5fbe9f5",
+    digest = "sha256:5f7d5664eae4a192c2d2d6cb67fc3f3c7891a8722cd2903cc35aa649a12b0c8d",
+    image = "docker.io/library/debian",
+    platforms = ["linux/amd64"],
+    tag = "12.6-slim",
+)
+use_repo(oci, "base_image", "base_image_linux_amd64")
+
+# some third party added rules python...
+# bazel_dep(name = "rules_python", version = "0.34.0")
+# bazel_dep(name = "grpc", version = "1.65.0")
+# bazel_dep(name = "rules_proto_grpc", version = "5.0.0")
