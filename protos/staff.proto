@@ -1,6 +1,12 @@
 syntax = "proto3";
 package staff;
 
+// needed for protoc-gen-prost
+service Dummy {
+        rpc Stub(OkayEnough)
+            returns (OkayEnough);
+}
+
 message OkayEnough {}
 
 message Blob {
@@ -18,11 +24,11 @@ message TopicSize {
 message DownstreamList {
         uint32 jitter_seconds = 1;
         uint32 delay_seconds = 2;
-        repeated string targets = 3;
+        repeated string target_uris = 3;
 }
 
 message Target {
-        string target = 1;
+        string target_uri = 1;
         uint32 status = 2;
         string msg = 3;
 }
@@ -31,5 +37,10 @@ message DownstreamStatus {
         uint32 jitter_seconds = 1;
         uint32 delay_seconds = 2;
         bool is_forwarding = 3;
-        repeated string targets = 4;
+        optional string last_run_completion = 4;
+        repeated Target targets = 5;
+}
+
+message SetForwarding {
+        bool is_forwarding = 1;
 }

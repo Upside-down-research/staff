@@ -13,13 +13,14 @@ use axum::{
 use clap::{Parser, Subcommand};
 use prost::Message;
 use std::collections::VecDeque;
-use std::fmt;
+use std::{fmt, thread};
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use std::{collections::HashMap, io::Read};
 use axum::routing::post;
 
+#[derive(Clone)]
 struct Downstreams {
     jitter_seconds: u16,
     delay_seconds: u16,
@@ -60,14 +61,14 @@ impl Downstreams {
 }
 
 struct DownstreamStatus {
-    last_run: std::time::Instant,
-    response: HashMap<String, (u32, String)>,
+    last_run_completion: std::time::Instant,
+    response: HashMap<String, (u16, String)>,
 }
 
 
 lazy_static::lazy_static! {
     static ref topics_in_memory: Arc<Mutex<HashMap<String, VecDeque<staff::Blob>>>> = Arc::new(Mutex::new(HashMap::new()));
-    static ref downstream_addresses: Arc<Mutex<Downstreams>> = Arc::new(Mutex::new(Downstreams::new()));
+    static ref downstream_addresses: Arc<RwLock<Downstreams>> = Arc::new(std::sync::RwLock::new(Downstreams::new()));
     static ref downstream_statuses:  Arc<Mutex<Option<DownstreamStatus>>> = Arc::new(Mutex::new(None));
     static ref is_forwarding: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 }
@@ -232,8 +233,8 @@ async fn forward_blobs(payload: axum::body::Bytes,) -> Result<Vec<u8>, HttpError
     match staff::DownstreamList::decode(&mut Cursor::new(buf)) {
         Ok(list) => {
 
-            let mut dl = downstream_addresses.lock().unwrap();
-            *dl = Downstreams::from(list.jitter_seconds as u16, list.delay_seconds as u16, list.targets)?;
+            let mut dl = downstream_addresses.write().unwrap();
+            *dl = Downstreams::from(list.jitter_seconds as u16, list.delay_seconds as u16, list.target_uris)?;
         }
         Err(e) => {
             return Err(HttpError::new(
@@ -246,12 +247,52 @@ async fn forward_blobs(payload: axum::body::Bytes,) -> Result<Vec<u8>, HttpError
     Ok(staff::OkayEnough{}.encode_to_vec())
 }
 async fn forward_status() -> Result<Vec<u8>, StatusCode> {
-    todo!()
+    let ds = downstream_statuses.lock().unwrap();
+    let ds = match &*ds {
+        Some(ds) => ds,
+        None => {
+            return Err(http::StatusCode::NOT_FOUND);
+        }
+    };
+
+    let mut targets = Vec::new();
+    for (uri, (status, msg)) in &ds.response {
+        targets.push(staff::Target {
+            target_uri: uri.clone(),
+            status: *status as u32,
+            msg: msg.clone(),
+        });
+    }
+
+
+    let is_fwd = is_forwarding.lock().unwrap();
+    let answer = staff::DownstreamStatus {
+        jitter_seconds: downstream_addresses.read().unwrap().jitter_seconds as u32,
+        delay_seconds: downstream_addresses.read().unwrap().delay_seconds as u32,
+        is_forwarding: *is_fwd,
+        last_run_completion: Some(format!("{:?}", ds.last_run_completion)),
+        targets,
+    };
+
+    Ok(answer.encode_to_vec())
 }
 
 async fn toggle_forwarding(payload: axum::body::Bytes) -> Result<Vec<u8>, HttpError> {
-    let is_fwd = is_forwarding.lock().unwrap();
-    *is_fwd = !*is_fwd;
+    let buf = payload.to_vec();
+
+    match staff::SetForwarding::decode(&mut Cursor::new(buf)) {
+        Ok(datum) => {
+            let mut is_fwd = is_forwarding.lock().unwrap();
+            *is_fwd = datum.is_forwarding;
+        }
+        Err(e) => {
+            return Err(HttpError::new(
+                Some(e.to_string().as_str()),
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+            ));
+        }
+    }
+
     Ok(staff::OkayEnough{}.encode_to_vec())
 }
 
@@ -283,29 +324,52 @@ async fn log(req: Request, next: Next) -> impl IntoResponse {
 #[derive(Subcommand, Debug)]
 enum ClientCommands {
     /// Pushes the blob to the server. Prefixed with a @, it will read a file
-    Post { blob: String },
+    Post {
+        #[arg(long, required = true)]
+        topic: String,
+        blob: String
+    },
     /// Pushes the blobs to the server. Prefixing a string with a @, it will read a file.
-    PostAll { blobs: Vec<String> },
+    PostAll {
+        #[arg(long, required = true)]
+        topic: String,
+        blobs: Vec<String>
+    },
     /// Pops the latest from the server
-    Get,
+    Get {
+        #[arg(long, required = true)]
+        topic: String,
+    },
     /// Pops all the data from the server
-    GetAll,
+    GetAll {
+        #[arg(long, required = true)]
+        topic: String,
+    },
     /// How many entries left in the topic
-    Head,
+    Head {
+        #[arg(long, required = true)]
+        topic: String,
+    },
     /// Cleans the topic.
-    Delete,
+    Delete {
+        #[arg(long, required = true)]
+        topic: String,
+    },
     /// Sets the list of forward
     SetForward {
         #[arg(default_value="30")]
-        delay: u16,
+        delay: u32,
         #[arg(default_value="15")]
-        jitter: u16,
+        jitter: u32,
         uris: Vec<String>,
     },
     /// Gets the forwarding configuring and status of their latest PostAll
     GetForward,
     /// ToggleForwarding
-    ToggleForwarding,
+    ToggleForwarding {
+        #[arg(long, required = true, action=clap::ArgAction::Set)]
+        forward: bool
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -318,8 +382,6 @@ enum Commands {
     Client {
         #[arg(long, required = true)]
         server: String,
-        #[arg(long, required = true)]
-        topic: String,
         #[command(subcommand)]
         methods: ClientCommands,
     },
@@ -377,6 +439,89 @@ fn collector(blob: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     Ok(data)
 }
 
+fn forward_daemon() {
+    loop {
+        let dl = {
+            // take a lock, read, drop.
+            downstream_addresses.read().unwrap().clone()
+        };
+
+        let is_fwd =  { is_forwarding.lock().unwrap().clone()  };
+
+        // when the entirety of the sending is erroring, we increase this.
+        let mut total_error_count: u32 = 0;
+        match is_fwd {
+            true => {
+                let mut ds = downstream_statuses.lock().unwrap();
+                let mut topics = topics_in_memory.lock().unwrap();
+                let mut status: HashMap<String, (u16, String)> = HashMap::new();
+                let mut cleared_topics = Vec::new();
+                for b in topics.keys() {
+                    let blobvec: Vec<staff::Blob> = { topics.get(b).unwrap().into_iter().map(|b| b.clone()).collect() };
+                    let bloblist = staff::BlobList { data: blobvec };
+                    let package = bloblist.encode_to_vec();
+                    let mut uri_error_count = 0;
+                    for uri in &dl.uris {
+                        let http_client = ureq::AgentBuilder::new().build();
+                        match http_client
+                            .post(uri)
+                            .send_bytes(&package) {
+                            Ok(r) => {
+                                cleared_topics.push(b.clone());
+                                status.insert(uri.clone(), (r.status(), r.status_text().to_string()));
+                            }
+                            Err(ureq::Error::Status(code, other)) => {
+                                status.insert(uri.clone(), (code, other.status_text().to_string()));
+                                eprintln!("error: {} - {}", code, other.status_text());
+                                uri_error_count += 1;
+                                continue;
+                            }
+                            Err(ureq::Error::Transport(t)) => {
+                                status.insert(uri.clone(), (604, t.to_string()));
+                                eprintln!("error: {}", t.to_string());
+                                uri_error_count += 1;
+                                continue;
+                            }
+                        };
+                    }
+
+                    if uri_error_count == dl.uris.len() && uri_error_count > 0 {
+                        total_error_count += 1;
+                    } else if uri_error_count == 0 {
+                        total_error_count = 0;
+                    }
+                }
+                for b in cleared_topics {
+                    topics.remove(&b);
+                }
+                *ds = Some(DownstreamStatus {
+                    last_run_completion: Instant::now(),
+                    response: HashMap::new(),
+                });
+            }
+            false => {
+                let mut ds = downstream_statuses.lock().unwrap();
+                *ds = Some(DownstreamStatus {
+                    last_run_completion: Instant::now(),
+                    response: HashMap::new(),
+                });
+            }
+        }
+
+        let sleep_delay_counter = match total_error_count {
+            0 => 0,
+            d if d < 10 => d as u8,
+            _ => 120,
+        };
+        let dt = chrono::prelude::Utc::now().to_string();
+        let dozy = std::time::Duration::from_secs(dl.next_run(sleep_delay_counter) as u64);
+        if is_fwd {
+            println!("{} sleeping for {:?}", dt, dozy);
+        }
+        std::thread::sleep(dozy);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -399,7 +544,7 @@ async fn main() {
                        get(forward_status)
                        .post(forward_blobs)
                 )
-                .route("/api/v1/forward/enable",
+                .route("/api/v1/forward/toggle",
                     post(toggle_forwarding))
                 .fallback(|| async {
                     http::Response::builder()
@@ -409,19 +554,20 @@ async fn main() {
                 })
                 .route_layer(middleware::from_fn(log));
 
+            let _ = thread::spawn(move || forward_daemon() );
+
             let listener = tokio::net::TcpListener::bind(server).await.unwrap();
             axum::serve(listener, app).await.unwrap();
         }
 
         Commands::Client {
             server,
-            topic,
             methods,
         } => {
             let http_client = ureq::AgentBuilder::new().build();
             // TODO: some refactoring here is in order.
             match methods {
-                ClientCommands::Post { blob } => {
+                ClientCommands::Post { topic, blob } => {
                     // blobs can either be _data_ themselves, can be stdin (-), or @..file
                     let data = collector(&blob).unwrap();
 
@@ -429,7 +575,7 @@ async fn main() {
                     let package = staff::Blob { datum: data }.encode_to_vec();
                     let _ = http_client.post(&uri).send_bytes(&package).unwrap();
                 }
-                ClientCommands::Get => {
+                ClientCommands::Get { topic } => {
                     let uri = format!("http://{}/api/v1/{}/blob", server, topic);
                     let resp: ureq::Response = match http_client.get(&uri).call() {
                         Ok(r) => r,
@@ -460,7 +606,7 @@ async fn main() {
                         }
                     }
                 }
-                ClientCommands::GetAll => {
+                ClientCommands::GetAll { topic } => {
                     let uri = format!("http://{}/api/v1/{}/blobs", server, topic);
                     let resp: ureq::Response = match http_client.get(&uri).call() {
                         Ok(r) => r,
@@ -493,7 +639,7 @@ async fn main() {
                         }
                     }
                 }
-                ClientCommands::Head => {
+                ClientCommands::Head { topic } => {
                     let uri = format!("http://{}/api/v1/{}/blobs", server, topic);
                     let resp: ureq::Response = match http_client.head(&uri).call() {
                         Ok(r) => r,
@@ -522,7 +668,7 @@ async fn main() {
                     }
 
                 }
-                ClientCommands::PostAll { blobs } => {
+                ClientCommands::PostAll { topic, blobs } => {
                     use std::sync::mpsc::{Receiver, Sender};
 
                     use std::sync::mpsc;
@@ -564,12 +710,63 @@ async fn main() {
                     let uri = format!("http://{}/api/v1/{}/blobs", server, topic);
                     let _ = http_client.post(&uri).send_bytes(&package).unwrap();
                 },
-                &ClientCommands::Delete => {
+                ClientCommands::Delete { topic } => {
                     let uri = format!("http://{}/api/v1/{}/blob", server, topic);
                     let _ = http_client.delete(&uri).call().unwrap();
                 },
-                &ClientCommands::SetForward { .. } | &ClientCommands::GetForward => todo!()
+                ClientCommands::SetForward { delay, jitter, uris  } => {
+                    let uri = format!("http://{}/api/v1/forward", server);
+                    let package = staff::DownstreamList {
+                        jitter_seconds: jitter.clone(),
+                        delay_seconds: delay.clone(),
+                        target_uris: uris.clone(),
+                    }
+                    .encode_to_vec();
+                    let _ = http_client.post(&uri).send_bytes(&package).unwrap();
+                }
 
+                ClientCommands::GetForward => {
+                    let uri = format!("http://{}/api/v1/forward", server);
+                    let resp: ureq::Response = match http_client.get(&uri).call() {
+                        Ok(r) => r,
+                        Err(ureq::Error::Transport(e)) => {
+                            eprintln!("{:?}", e);
+                            return;
+                        }
+                        Err(ureq::Error::Status(_code, response)) => {
+                            eprintln!("{:?}", response);
+                            return;
+                        }
+                    };
+                    let len: usize = resp.header("Content-Length").unwrap().parse().unwrap();
+                    let mut buf: Vec<u8> = Vec::with_capacity(len);
+                    resp.into_reader()
+                        .take(10_000_000)
+                        .read_to_end(&mut buf)
+                        .unwrap();
+                    match staff::DownstreamStatus::decode(&mut Cursor::new(buf)) {
+                        Ok(ds) => {
+                            println!("jitter: {}", ds.jitter_seconds);
+                            println!("delay: {}", ds.delay_seconds);
+                            println!("forwarding: {}", ds.is_forwarding);
+                            for t in ds.targets {
+                                println!("target: {} status: {} msg: {}", t.target_uri, t.status, t.msg);
+                            }
+                        }
+                        Err(e) => {
+                            eprint!("got error decoding result: {}", e)
+                        }
+                    }
+
+                }
+                &ClientCommands::ToggleForwarding { forward } => {
+                    let uri = format!("http://{}/api/v1/forward/toggle", server);
+                    let package = staff::SetForwarding {
+                        is_forwarding: forward,
+                    }
+                    .encode_to_vec();
+                    let _ = http_client.post(&uri).send_bytes(&package).unwrap();
+                }
             }
         }
     }
